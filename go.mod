@@ -1,4 +1,4 @@
-module nateri/eazye
+module github.com/nateri/eazye
 
 go 1.18
 
