@@ -11,6 +11,7 @@ import (
 	"mime"
 	"mime/multipart"
 	"net/mail"
+	"strconv"
 	"strings"
 	"time"
 
@@ -117,8 +118,26 @@ func GetSince(info MailboxInfo, since time.Time, markAsRead, delete bool) ([]Ema
 
 // GenerateSince will find all emails that have an internal date after the given time and pass them along to the
 // responses channel.
+func GenerateOn(info MailboxInfo, on time.Time, markAsRead, delete bool) (chan Response, error) {
+	return generateMailOn(info, "", &on, markAsRead, delete)
+}
+
+// GenerateSince will find all emails that have an internal date after the given time and pass them along to the
+// responses channel.
 func GenerateSince(info MailboxInfo, since time.Time, markAsRead, delete bool) (chan Response, error) {
 	return generateMail(info, "", &since, markAsRead, delete)
+}
+
+// GenerateBetween will find all emails between internal dates first to last and pass them along to the
+// responses channel.
+func GenerateBefore(info MailboxInfo, before time.Time, markAsRead, delete bool) (chan Response, error) {
+	return generateMailBefore(info, "", &before, markAsRead, delete)
+}
+
+// GenerateBetween will find all emails between internal dates first to last and pass them along to the
+// responses channel.
+func GenerateBetween(info MailboxInfo, fromUid uint64, toUid uint64, markAsRead, delete bool) (chan Response, error) {
+	return generateMailBetween(info, "", fromUid, toUid, markAsRead, delete)
 }
 
 // MarkAsUnread will set the UNSEEN flag on a supplied slice of UIDs
@@ -171,6 +190,19 @@ func ValidateMailboxInfo(info MailboxInfo) error {
 		client.Logout(30 * time.Second)
 	}()
 	return err
+}
+
+// ValidateMailboxInfo attempts to login to the supplied IMAP account to ensure the info is correct
+func GetMailboxStatus(info MailboxInfo) (*imap.MailboxStatus, error) {
+	client, err := newIMAPClient(info)
+	if nil == err {
+		return client.Mailbox, nil
+	}
+	defer func() {
+		client.Close(true)
+		client.Logout(30 * time.Second)
+	}()
+	return nil, err
 }
 
 // Email is a simplified email struct containing the basic pieces of an email. If you want more info,
@@ -259,7 +291,23 @@ func (e *Email) VisibleText() ([][]byte, error) {
 }
 
 // String is to spit out a somewhat pretty version of the email.
-func (e *Email) String() string {
+func (e *Email) String(skipBody bool) string {
+	if skipBody {
+		return fmt.Sprintf(`UID:            %v
+From:           %s
+To:             %s
+Internal Date:  %s
+Precedence:     %s
+Subject:        %s
+----------------------------`,
+			e.UID,
+			e.From,
+			e.To,
+			e.InternalDate,
+			e.Precedence,
+			e.Subject,
+		)
+	}
 	return fmt.Sprintf(`
 ----------------------------
 From:           %s
@@ -322,8 +370,8 @@ func newIMAPClient(info MailboxInfo) (*imap.Client, error) {
 
 const dateFormat = "02-Jan-2006"
 
-// findEmails will run a find the UIDs of any emails that match the search.:
-func findEmails(client *imap.Client, search string, since *time.Time) (*imap.Command, error) {
+// findEmailsSince will find the emails since the day that match the search.:
+func findEmailsSince(client *imap.Client, search string, since *time.Time) (*imap.Command, error) {
 	var specs []imap.Field
 	if len(search) > 0 {
 		specs = append(specs, search)
@@ -342,7 +390,67 @@ func findEmails(client *imap.Client, search string, since *time.Time) (*imap.Com
 	return cmd, nil
 }
 
-var GenerateBufferSize = 100
+// findEmailsOn will find the emails from a day that match the search.:
+func findEmailsOn(client *imap.Client, search string, on *time.Time) (*imap.Command, error) {
+	var specs []imap.Field
+	if len(search) > 0 {
+		specs = append(specs, search)
+	}
+
+	if on != nil {
+		onStr := on.Format(dateFormat)
+		specs = append(specs, "ON", onStr)
+	}
+
+	// get headers and UID for UnSeen message in src inbox...
+	cmd, err := imap.Wait(client.UIDSearch(specs...))
+	if err != nil {
+		return &imap.Command{}, fmt.Errorf("uid search failed: %s", err)
+	}
+	return cmd, nil
+}
+
+// findEmailsBefore will find the emails before a time that match the search.:
+func findEmailsBefore(client *imap.Client, search string, before *time.Time) (*imap.Command, error) {
+	var specs []imap.Field
+	if len(search) > 0 {
+		specs = append(specs, search)
+	}
+
+	if before != nil {
+		beforeStr := before.Format(dateFormat)
+		specs = append(specs, "BEFORE", beforeStr)
+	}
+
+	// get headers and UID for UnSeen message in src inbox...
+	cmd, err := imap.Wait(client.UIDSearch(specs...))
+	if err != nil {
+		return &imap.Command{}, fmt.Errorf("uid search failed: %s", err)
+	}
+	return cmd, nil
+}
+
+// findEmailsBetween will find emails in the range of UIDs that match the search.:
+func findEmailsBetween(client *imap.Client, search string, first uint64, last uint64) (*imap.Command, error) {
+	var specs []imap.Field
+	if len(search) > 0 {
+		specs = append(specs, search)
+	}
+
+	strFirst := strconv.FormatUint(first, 10)
+	strLast := strconv.FormatUint(last, 10)
+	strRange := strFirst + ":" + strLast
+	specs = append(specs, "UID", strRange)
+
+	// get headers and UID for UnSeen message in src inbox...
+	cmd, err := imap.Wait(client.UIDSearch(specs...))
+	if err != nil {
+		return &imap.Command{}, fmt.Errorf("uid search failed: %s", err)
+	}
+	return cmd, nil
+}
+
+var GenerateBufferSize = 100000
 
 func generateMail(info MailboxInfo, search string, since *time.Time, markAsRead, delete bool) (chan Response, error) {
 	responses := make(chan Response, GenerateBufferSize)
@@ -361,7 +469,94 @@ func generateMail(info MailboxInfo, search string, since *time.Time, markAsRead,
 
 		var cmd *imap.Command
 		// find all the UIDs
-		cmd, err = findEmails(client, search, since)
+		cmd, err = findEmailsSince(client, search, since)
+		if err != nil {
+			responses <- Response{Err: err}
+			return
+		}
+		// gotta fetch 'em all
+		getEmails(client, cmd, markAsRead, delete, responses)
+	}()
+
+	return responses, nil
+}
+
+func generateMailOn(info MailboxInfo, search string, on *time.Time, markAsRead, delete bool) (chan Response, error) {
+	responses := make(chan Response, GenerateBufferSize)
+	client, err := newIMAPClient(info)
+	if err != nil {
+		close(responses)
+		return responses, fmt.Errorf("uid search failed: %s", err)
+	}
+
+	go func() {
+		defer func() {
+			client.Close(true)
+			client.Logout(30 * time.Second)
+			close(responses)
+		}()
+
+		var cmd *imap.Command
+		// find all the UIDs
+		cmd, err = findEmailsOn(client, search, on)
+		if err != nil {
+			responses <- Response{Err: err}
+			return
+		}
+		// gotta fetch 'em all
+		getEmails(client, cmd, markAsRead, delete, responses)
+	}()
+
+	return responses, nil
+}
+
+func generateMailBefore(info MailboxInfo, search string, before *time.Time, markAsRead, delete bool) (chan Response, error) {
+	responses := make(chan Response, GenerateBufferSize)
+	client, err := newIMAPClient(info)
+	if err != nil {
+		close(responses)
+		return responses, fmt.Errorf("uid search failed: %s", err)
+	}
+
+	go func() {
+		defer func() {
+			client.Close(true)
+			client.Logout(30 * time.Second)
+			close(responses)
+		}()
+
+		var cmd *imap.Command
+		// find all the UIDs
+		cmd, err = findEmailsBefore(client, search, before)
+		if err != nil {
+			responses <- Response{Err: err}
+			return
+		}
+		// gotta fetch 'em all
+		getEmails(client, cmd, markAsRead, delete, responses)
+	}()
+
+	return responses, nil
+}
+
+func generateMailBetween(info MailboxInfo, search string, first uint64, last uint64, markAsRead, delete bool) (chan Response, error) {
+	responses := make(chan Response, GenerateBufferSize)
+	client, err := newIMAPClient(info)
+	if err != nil {
+		close(responses)
+		return responses, fmt.Errorf("uid search failed: %s", err)
+	}
+
+	go func() {
+		defer func() {
+			client.Close(true)
+			client.Logout(30 * time.Second)
+			close(responses)
+		}()
+
+		var cmd *imap.Command
+		// find all the UIDs
+		cmd, err = findEmailsBetween(client, search, first, last)
 		if err != nil {
 			responses <- Response{Err: err}
 			return
